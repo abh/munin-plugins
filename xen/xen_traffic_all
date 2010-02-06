@@ -1,0 +1,105 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use Munin::Plugin;
+
+# Author: Ask Bjørn Hansen <ask@develooper.com>
+# Description: measure traffic for all xen hosts
+# Based on shell/awk script by Mario Manno
+
+#%# family=auto
+#%# capabilities=autoconf
+
+my $arg = shift || 'fetch';
+
+my $XM = '/usr/sbin/xm';
+
+if ($arg eq 'autoconf') {
+    unless (-x $XM) {
+        print "no ($XM not found)\n";
+        exit 1;
+    }
+    unless (-r '/proc/net/dev') {
+        print "no (/proc/net/dev not readable)\n";
+        exit 1;
+    }
+    print "yes\n";
+    exit 0;
+}
+
+my @domains = map { my ($raw) = split /\s/;
+                    my $name = $raw;
+                    $name =~ s/-/_/g;
+                    +{ name     => $name,
+                       raw_name => $raw,
+                     }
+                } grep { $_ !~ m/^(Name|Domain-0)/ } split /\n/, `$XM list`;
+
+for my $domain (@domains) {
+    my @networks = 
+        grep { $_->{vif} }
+        map  { my @n = split /\s+/;
+               m,vif/(\d+)/(\d+)\s*$,;
+               my $vif = defined $2 ? "vif$1.$2" : "";
+               { id => $n[0], vif => $vif }
+             }
+        grep { m/^\d+/ }
+        split /\n/, `xm network-list $domain->{raw_name}`;
+    $domain->{networks} = \@networks;
+} 
+
+if ($arg eq 'config') {
+    print "graph_title Xen Traffic\n";
+    print "graph_vlabel bits received (-) / sent (+) per \${graph_period}\n";
+    print "graph_args --base 1024 -l 0\n";
+    print "graph_category xen\n";
+    for my $domain (@domains) {
+        for my $net (@{ $domain->{networks} }) {
+
+            my $id   = join "_", $domain->{name}, $net->{id};
+
+            for my $dir ({ name => 'down', label => 'received' },
+                         { name => 'up',   label => "$domain->{name} $net->{id}" },
+                         ) {
+                my $fid = join "_", $id, $dir->{name};
+ 
+                my $config = <<EOC;
+                    ${fid}.label $dir->{label}
+                    ${fid}.type COUNTER
+                    ${fid}.cdef ${fid},8,*
+
+EOC
+                $config =~ s/^\s+//gms;
+
+                print $config;
+           }
+           print "${id}_down.graph no\n";
+           print "${id}_up.negative ${id}_down\n";
+        }
+    }
+    exit 0;
+}
+
+  
+my %status = 
+  map { my ($vif, $status) = split /:/, $_, 2;
+        #print "[$_]\n";
+        $status = [ split /\s+/, $status ];
+        ($vif => $status);
+    }
+  grep { m/^vif/ }
+  map  { s/^\s+//; $_ }
+  do {
+      local $/ = undef;
+      open my $fh, '</proc/net/dev';
+      split /\n/, <$fh>;
+  };
+
+for my $domain (@domains) {
+    for my $net (@{ $domain->{networks} }) {
+        print join("_", $domain->{name}, $net->{id}, 'down.value ') . $status{$net->{vif}}->[0] . "\n";
+        print join("_", $domain->{name}, $net->{id}, 'up.value ')   . $status{$net->{vif}}->[8] . "\n";
+    }
+}
+
+
